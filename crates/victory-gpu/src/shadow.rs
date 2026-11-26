@@ -75,6 +75,8 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Newest host submission fence value when last asked for.
+    last_fence: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -3056,6 +3058,133 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Fence-gated LRU eviction of cached `Shadow` buffer/window copies across
+/// `LOOSE` and clean read-only `BUFFERS`, unpinning and nulling any stale
+/// bindless descriptor slots.
+pub(crate) fn evict_lru(
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    evict_lru_in(&LOOSE, &BUFFERS, completed_fence, frame, needed_bytes, cap)
+}
+
+fn evict_lru_in(
+    loose_map: &std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>>,
+    buffers_map: &std::sync::RwLock<BTreeMap<(u64, usize), Entry>>,
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    let cap = if needed_bytes.is_some() {
+        cap.min(crate::gc::OVER_BUDGET_SWEEP_CAP)
+    } else {
+        cap
+    };
+    if cap == 0 {
+        return (0, 0);
+    }
+    let can_evict = |s: &Arc<Shadow>| -> bool {
+        if s.place.is_some()
+            || Arc::strong_count(s) != 1
+            || completed_fence < s.last_fence.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let last_frame = s.used.load(Ordering::Relaxed) >> 32;
+        let age = frame.saturating_sub(last_frame);
+        let old_enough = if needed_bytes.is_some() {
+            age >= crate::gc::OVER_BUDGET_MIN_IDLE_FRAMES
+        } else {
+            age > crate::gc::IDLE_FRAMES
+        };
+        if !old_enough {
+            return false;
+        }
+        let pinned = crate::descriptor::host::slot_ref_count(&s.buffer);
+        (crate::host::references(&s.buffer) as usize) == 1 + pinned
+    };
+
+    let mut evicted: Vec<Arc<Shadow>> = Vec::new();
+    let mut freed_bytes = 0u64;
+
+    // 1. Loose windows outside title buffers.
+    {
+        let mut map = loose_map.write().unwrap_or_else(|e| e.into_inner());
+        if !map.is_empty() {
+            let mut candidates: Vec<(u64, (u64, u64))> = map
+                .iter()
+                .filter_map(|(&key, s)| can_evict(s).then_some((s.used.load(Ordering::Relaxed), key)))
+                .collect();
+            candidates.sort_unstable_by_key(|&(used, key)| (used >> 32, used & 0xffff_ffff, key));
+            for (_, key) in candidates {
+                if evicted.len() >= cap {
+                    break;
+                }
+                if let Some(target) = needed_bytes
+                    && freed_bytes >= target
+                {
+                    break;
+                }
+                if let Some(s) = map.remove(&key) {
+                    freed_bytes = freed_bytes.saturating_add(s.len);
+                    evicted.push(s);
+                }
+            }
+        }
+    }
+
+    // 2. Clean read-only registered title buffer copies in `BUFFERS` (including
+    //    device-local `CARDED` twins), leaving the registration entry intact so
+    //    any future read transparently recreates the shadow copy.
+    if evicted.len() < cap && needed_bytes.is_none_or(|t| freed_bytes < t) {
+        let mut map = buffers_map.write().unwrap_or_else(|e| e.into_inner());
+        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        let mut candidates: Vec<(u64, (u64, usize))> = map
+            .iter()
+            .filter_map(|(&key, entry)| {
+                if key.1 == key.0 as usize {
+                    return None;
+                }
+                let s = entry.shadow.as_ref()?;
+                if s.written.load(Ordering::Relaxed) || !can_evict(s) {
+                    return None;
+                }
+                Some((s.used.load(Ordering::Relaxed), key))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(used, key)| (used >> 32, used & 0xffff_ffff, key));
+        for (_, key) in candidates {
+            if evicted.len() >= cap {
+                break;
+            }
+            if let Some(target) = needed_bytes
+                && freed_bytes >= target
+            {
+                break;
+            }
+            if let Some(entry) = map.get_mut(&key)
+                && let Some(s) = entry.shadow.take()
+            {
+                freed_bytes = freed_bytes.saturating_add(s.len);
+                evicted.push(s);
+            }
+        }
+    }
+
+    // Locks on `LOOSE` and `BUFFERS` are dropped before clearing bindless slots.
+    let count = evicted.len();
+    for shadow in evicted {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        let _ = crate::descriptor::host::evict_resource(&shadow.buffer);
+        crate::host::retire(shadow);
+    }
+    (count, freed_bytes)
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -3093,6 +3222,17 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    fn touch(&self) {
+        let now = crate::host::moment();
+        if self.used.load(Ordering::Relaxed) != now {
+            self.used.store(now, Ordering::Relaxed);
+        }
+        let fence = crate::host::pending_submission_fence();
+        if self.last_fence.load(Ordering::Relaxed) < fence {
+            self.last_fence.store(fence, Ordering::Relaxed);
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3194,6 +3334,7 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            last_fence: AtomicU64::new(crate::host::pending_submission_fence()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
@@ -5200,6 +5341,7 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        shadow.touch();
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -5208,6 +5350,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
+                shadow.touch();
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -5515,10 +5658,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
+        shadow.touch();
         if shadow.asked[0].load(Ordering::Relaxed) > address {
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
         }
@@ -5654,7 +5794,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.touch();
         return Some(shadow.clone());
     }
     if map.len() >= MANY {
@@ -5697,10 +5837,120 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod window_tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
+    use std::sync::atomic::Ordering;
+
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        Entry, LOOSE, Shadow, WINDOW, cover, default_card_limits_mb, evict_lru, evict_lru_in,
+        grid, holder, longest_tail, resolve_card_limits, tail_of, window_of, window_victims,
     };
+
+    #[test]
+    fn shadow_evict_lru_enforces_fence_gating_age_floor_and_cap() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make_shadow = |start: u64, last_frame: u64, last_fence: u64| -> Arc<Shadow> {
+            let (buffer, data) = host.upload_buffer(4096).expect("upload buffer");
+            let s = Shadow::new(buffer, data, 0, start, 4096);
+            s.used.store((last_frame << 32) | 1, Ordering::Relaxed);
+            s.last_fence.store(last_fence, Ordering::Relaxed);
+            Arc::new(s)
+        };
+
+        let loose = RwLock::new(BTreeMap::new());
+        let buffers = RwLock::new(BTreeMap::new());
+        {
+            let mut l = loose.write().unwrap();
+            // Oldest (frame 10), but GPU fence 20 not completed yet -> gated out!
+            l.insert((0x10_0000, 4096), make_shadow(0x10_0000, 10, 20));
+            // Old and completed (frame 20, fence 5), oldest eligible.
+            l.insert((0x20_0000, 4096), make_shadow(0x20_0000, 20, 5));
+            // Old and completed (frame 30, fence 5), second oldest eligible.
+            l.insert((0x30_0000, 4096), make_shadow(0x30_0000, 30, 5));
+            // Frame 180 (20 frames old at frame 200: >= 16 over-budget floor, <= 120 routine floor).
+            l.insert((0x40_0000, 4096), make_shadow(0x40_0000, 180, 5));
+            // Frame 190 (10 frames old at frame 200: < 16 over-budget floor -> never evicted!).
+            l.insert((0x50_0000, 4096), make_shadow(0x50_0000, 190, 5));
+        }
+        {
+            let mut b = buffers.write().unwrap();
+            // Clean read-only buffer shadow (frame 175, fence 5) -> eligible under pressure.
+            b.insert(
+                (0x60_0000, 0x9999),
+                Entry {
+                    end: 0x60_1000,
+                    shadow: Some(make_shadow(0x60_0000, 175, 5)),
+                },
+            );
+            // GPU-written buffer shadow -> must never be evicted!
+            let dirty = make_shadow(0x70_0000, 15, 5);
+            dirty.written.store(true, Ordering::Relaxed);
+            b.insert(
+                (0x70_0000, 0x999a),
+                Entry {
+                    end: 0x70_1000,
+                    shadow: Some(dirty),
+                },
+            );
+        }
+
+        // 1. Routine sweep at frame 200 with `completed_fence = 10`, `cap = 1`:
+        //    `0x10_0000` is blocked by fence 20 > 10; `0x20_0000` and `0x30_0000` are > 120 frames old,
+        //    capped at 1 so only oldest (`0x20_0000`) is evicted.
+        assert_eq!(evict_lru_in(&loose, &buffers, 10, 200, None, 1), (1, 4096));
+        assert!(loose.read().unwrap().contains_key(&(0x10_0000, 4096)));
+        assert!(!loose.read().unwrap().contains_key(&(0x20_0000, 4096)));
+        assert!(loose.read().unwrap().contains_key(&(0x30_0000, 4096)));
+
+        // 2. Routine sweep at frame 200 with `cap = 10`: evicts `0x30_0000` (> 120 frames),
+        //    leaves `0x40_0000` (20 frames <= 120), `0x50_0000` (10 frames), and `0x60_0000` (25 frames).
+        assert_eq!(evict_lru_in(&loose, &buffers, 10, 200, None, 10), (1, 4096));
+        assert!(loose.read().unwrap().contains_key(&(0x40_0000, 4096)));
+
+        // 3. Over-budget sweep at frame 200 (`completed_fence = 10`, needing 64 KiB, `cap = 10`):
+        //    evicts `0x40_0000` (20 frames >= 16) and clean buffer `0x60_0000` (25 frames >= 16),
+        //    while preserving `0x50_0000` (10 frames < 16 age floor), `0x10_0000` (fence 20 > 10),
+        //    and GPU-written `0x70_0000`!
+        assert_eq!(
+            evict_lru_in(&loose, &buffers, 10, 200, Some(64 << 10), 10),
+            (2, 8192)
+        );
+        assert!(loose.read().unwrap().contains_key(&(0x50_0000, 4096)));
+        assert!(loose.read().unwrap().contains_key(&(0x10_0000, 4096)));
+        assert!(buffers.read().unwrap()[&(0x60_0000, 0x9999)].shadow.is_none());
+        assert!(buffers.read().unwrap()[&(0x70_0000, 0x999a)].shadow.is_some());
+
+        // 4. Advance `completed_fence` to 20: `0x10_0000` is now fence-completed and evicted!
+        assert_eq!(
+            evict_lru_in(&loose, &buffers, 20, 200, Some(64 << 10), 10),
+            (1, 4096)
+        );
+        assert!(!loose.read().unwrap().contains_key(&(0x10_0000, 4096)));
+        assert!(loose.read().unwrap().contains_key(&(0x50_0000, 4096)));
+
+        // 5. Direct `shadow::evict_lru` cap check on `LOOSE` (`cap = 2` stops at 2 entries).
+        let keys = [
+            (0xf000_1000u64, 4096u64),
+            (0xf000_2000, 4096),
+            (0xf000_3000, 4096),
+        ];
+        {
+            let mut global_loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            for &(k, len) in &keys {
+                global_loose.insert((k, len), make_shadow(k, 1, 0));
+            }
+        }
+        let (evicted_n, evicted_b) = evict_lru(u64::MAX, 500, Some(64 << 10), 2);
+        {
+            let mut global_loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            let remaining = keys.iter().filter(|k| global_loose.remove(k).is_some()).count();
+            assert_eq!(evicted_n, 2);
+            assert_eq!(evicted_b, 8192);
+            assert_eq!(remaining, 1);
+        }
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {

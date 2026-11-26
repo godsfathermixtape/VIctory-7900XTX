@@ -1209,6 +1209,92 @@ static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 #[cfg(windows)]
 type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Refusal {
+    None = 0,
+    /// Temporary OOM or residency failure: suppressed until VRAM eviction frees headroom.
+    Transient = 1,
+    /// Invalid/unsupported description, missing host GPU, or device loss: never retried.
+    Permanent = 2,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+struct RefusalState(std::sync::atomic::AtomicU8);
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+impl RefusalState {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Refusal::None as u8))
+    }
+
+    #[cfg(test)]
+    fn get(&self) -> Refusal {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Refusal::Transient,
+            2 => Refusal::Permanent,
+            _ => Refusal::None,
+        }
+    }
+
+    fn is_refused(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) != Refusal::None as u8
+    }
+
+    fn is_permanently_refused(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) == Refusal::Permanent as u8
+    }
+
+    fn set(&self, refusal: Refusal) {
+        self.0.store(refusal as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resets a transient allocation refusal back to `None` when VRAM headroom
+    /// returns, leaving permanent refusals set.
+    fn clear_transient(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Refusal::Transient as u8,
+                Refusal::None as u8,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_create_error(hr: i32) -> Refusal {
+    const E_OUTOFMEMORY_HR: i32 = 0x8007_000E_u32 as i32;
+    const ERROR_COMMITMENT_LIMIT_HR: i32 = 0x8007_05AF_u32 as i32;
+    if hr == E_OUTOFMEMORY_HR || hr == ERROR_COMMITMENT_LIMIT_HR {
+        Refusal::Transient
+    } else {
+        Refusal::Permanent
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_residency_error(hr: i32) -> Refusal {
+    const DXGI_DEVICE_REMOVED: i32 = 0x887A_0005_u32 as i32;
+    const DXGI_DEVICE_HUNG: i32 = 0x887A_0006_u32 as i32;
+    const DXGI_DEVICE_RESET: i32 = 0x887A_0007_u32 as i32;
+    const DXGI_DRIVER_INTERNAL_ERROR: i32 = 0x887A_0020_u32 as i32;
+    if matches!(
+        hr,
+        DXGI_DEVICE_REMOVED | DXGI_DEVICE_HUNG | DXGI_DEVICE_RESET | DXGI_DRIVER_INTERNAL_ERROR
+    ) {
+        Refusal::Permanent
+    } else {
+        Refusal::Transient
+    }
+}
+
+#[cfg(windows)]
+static HAS_TRANSIENT_REFUSAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A title texture's host side. The host copy is made when something first
 /// uses the texture, not when the title creates it: the title
 /// had created 3,871 textures (9.2 GB on the host) before its world's first
@@ -1226,8 +1312,10 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// Newest host submission fence value when last asked for.
+    last_fence: std::sync::atomic::AtomicU64,
+    /// Host creation refusal state (transient OOM vs. permanent invalid resource).
+    refused: RefusalState,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1552,7 +1640,7 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !r.host.refused.is_permanently_refused()
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
@@ -1567,7 +1655,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        if !make || r.host.refused.is_refused() {
             return None;
         }
         let clear = r
@@ -1601,7 +1689,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, true).ok()
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1634,12 +1726,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => Ok(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match texture {
+            Ok(texture) => texture,
+            Err(refusal) => {
+                r.host.refused.set(refusal);
+                if refusal == Refusal::Transient {
+                    HAS_TRANSIENT_REFUSAL.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return None;
+            }
         };
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
@@ -1684,6 +1782,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     let now = crate::host::moment();
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
+    }
+    let fence = crate::host::pending_submission_fence();
+    if r.host.last_fence.load(Relaxed) < fence {
+        r.host.last_fence.store(fence, Relaxed);
     }
     made.clone()
 }
@@ -2186,6 +2288,186 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Fence-gated LRU eviction of cached `HostTexture` copies, safely unpinning
+/// and nulling stale bindless descriptor slots (`HostHeap::kept`).
+///
+/// - When `needed_bytes` is `None` (routine sweep): inspects a rolling window
+///   and evicts at most `cap` textures unused for `> 120` frames whose
+///   `last_fence <= completed_fence`.
+/// - When `needed_bytes` is `Some(target)` (over VRAM watermark): sorts
+///   fence-completed textures at least `OVER_BUDGET_MIN_IDLE_FRAMES` old
+///   oldest-first and evicts up to `cap.min(OVER_BUDGET_SWEEP_CAP)` until
+///   `freed_bytes >= target`.
+/// - When `freed_bytes > 0`, clears transient allocation refusals so suppressed
+///   textures can retry once VRAM headroom returns.
+#[cfg(windows)]
+pub(crate) fn evict_lru(
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    evict_lru_in(&TEXTURES, &CURSOR, completed_fence, frame, needed_bytes, cap)
+}
+
+#[cfg(windows)]
+fn evict_lru_in(
+    table: &std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    cursor: &std::sync::atomic::AtomicUsize,
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let cap = if needed_bytes.is_some() {
+        cap.min(crate::gc::OVER_BUDGET_SWEEP_CAP)
+    } else {
+        cap
+    };
+    if cap == 0 {
+        return (0, 0);
+    }
+    const ROUTINE_SCAN: usize = 4096;
+
+    let mut evicted: Vec<Made> = Vec::new();
+    let mut freed_bytes = 0u64;
+    let mut first_at = None;
+
+    {
+        let all = table.lock().unwrap_or_else(|e| e.into_inner());
+        if all.is_empty() {
+            return (0, 0);
+        }
+        let candidates: Vec<usize> = if needed_bytes.is_some() {
+            let mut aged: Vec<(u64, usize)> = all
+                .iter()
+                .copied()
+                .filter_map(|at| {
+                    // SAFETY: `all` holds `table` lock; `Drop for Resource` removes `at` under `TEXTURES`.
+                    let r = unsafe { &*(at as *const Resource) };
+                    let used = r.host.used.load(Relaxed);
+                    let last_frame = used >> 32;
+                    let ok = used != 0
+                        && fills(&r.desc)
+                        && frame.saturating_sub(last_frame) >= crate::gc::OVER_BUDGET_MIN_IDLE_FRAMES
+                        && completed_fence >= r.host.last_fence.load(Relaxed)
+                        && !crate::texture::host_wrote(at);
+                    ok.then_some((used, at))
+                })
+                .collect();
+            aged.sort_unstable_by_key(|&(used, at)| (used >> 32, used & 0xffff_ffff, at));
+            aged.into_iter().map(|(_, at)| at).collect()
+        } else {
+            let start = cursor.load(Relaxed);
+            let mut scanned = 0usize;
+            let mut out = Vec::new();
+            for &at in all.range(start..).take(ROUTINE_SCAN) {
+                scanned += 1;
+                // SAFETY: `table` lock is held.
+                let r = unsafe { &*(at as *const Resource) };
+                let used = r.host.used.load(Relaxed);
+                let last_frame = used >> 32;
+                if used != 0
+                    && fills(&r.desc)
+                    && frame.saturating_sub(last_frame) > crate::gc::IDLE_FRAMES
+                    && completed_fence >= r.host.last_fence.load(Relaxed)
+                    && !crate::texture::host_wrote(at)
+                {
+                    out.push((last_frame, at));
+                }
+                if scanned == ROUTINE_SCAN {
+                    cursor.store(at.saturating_add(1), Relaxed);
+                }
+            }
+            if scanned < ROUTINE_SCAN {
+                cursor.store(0, Relaxed);
+            }
+            out.sort_unstable_by_key(|&(f, at)| (f, at));
+            out.into_iter().map(|(_, at)| at).collect()
+        };
+
+        for at in candidates {
+            if evicted.len() >= cap {
+                break;
+            }
+            if let Some(target) = needed_bytes
+                && freed_bytes >= target
+            {
+                break;
+            }
+            // SAFETY: `table` lock is held.
+            let r = unsafe { &*(at as *const Resource) };
+            let taken = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let can_evict = made.as_ref().is_some_and(|(host, twin)| {
+                    if std::sync::Arc::strong_count(host) != 1
+                        || host.ahead.load(Relaxed) == 1
+                        || completed_fence < r.host.last_fence.load(Relaxed)
+                    {
+                        return false;
+                    }
+                    let age = frame.saturating_sub(r.host.used.load(Relaxed) >> 32);
+                    let old_enough = if needed_bytes.is_some() {
+                        age >= crate::gc::OVER_BUDGET_MIN_IDLE_FRAMES
+                    } else {
+                        age > crate::gc::IDLE_FRAMES
+                    };
+                    if !old_enough {
+                        return false;
+                    }
+                    let pinned = crate::descriptor::host::slot_ref_count(&host.texture);
+                    twin.is_none() && (crate::host::references(&host.texture) as usize) == 1 + pinned
+                });
+                if can_evict {
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    r.host.gone.store(true, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pair) = taken {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(pair.0.bytes, Relaxed);
+                freed_bytes = freed_bytes.saturating_add(pair.0.bytes);
+                if first_at.is_none() {
+                    first_at = Some(at);
+                }
+                evicted.push(pair);
+            }
+        }
+
+        if freed_bytes > 0 && HAS_TRANSIENT_REFUSAL.swap(false, AcqRel) {
+            for &at in all.iter() {
+                // SAFETY: `table` lock is held.
+                let r = unsafe { &*(at as *const Resource) };
+                r.host.refused.clear_transient();
+            }
+        }
+    }
+
+    // All `TEXTURES` and `r.host.made` locks are released before nulling
+    // bindless slots and retiring D3D12 resources.
+    let count = evicted.len();
+    for (host, twin) in evicted {
+        let _ = crate::descriptor::host::evict_resource(&host.texture);
+        crate::host::retire((host, twin));
+    }
+    if count > 0 {
+        crate::host::trail(|| {
+            format!(
+                "gc: {count} cached textures evicted ({} KiB), descriptor slots nulled; first: {:#x}",
+                freed_bytes >> 10,
+                first_at.unwrap_or(0)
+            )
+        });
+    }
+    (count, freed_bytes)
+}
+
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
 #[cfg(windows)]
@@ -2465,7 +2747,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, Refusal> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2477,13 +2759,15 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, Refusal> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return Err(Refusal::Permanent);
     }
-    let host = crate::host::host()?;
+    let Some(host) = crate::host::host() else {
+        return Err(Refusal::Permanent);
+    };
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2550,7 +2834,7 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return Ok(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2588,21 +2872,23 @@ fn host_texture_as(
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        return Err(classify_create_error(e.code().0));
     }
     if !reserved
-        && made.is_ok()
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        return Err(classify_residency_error(e.code().0));
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    let Some(t) = texture else {
+        return Err(Refusal::Permanent);
+    };
+    crate::host::name(&t, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    Ok(t)
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2740,7 +3026,8 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            last_fence: std::sync::atomic::AtomicU64::new(0),
+            refused: RefusalState::new(),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -4631,5 +4918,108 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn transient_refusal_resets_on_eviction_while_permanent_stays_set() {
+        // 1. Pure state & HRESULT classification checks.
+        assert_eq!(classify_create_error(0x8007_000E_u32 as i32), Refusal::Transient);
+        assert_eq!(classify_create_error(0x8007_05AF_u32 as i32), Refusal::Transient);
+        assert_eq!(classify_create_error(E_INVALIDARG), Refusal::Permanent);
+        assert_eq!(classify_residency_error(0x8007_000E_u32 as i32), Refusal::Transient);
+        assert_eq!(classify_residency_error(0x887A_0005_u32 as i32), Refusal::Permanent);
+
+        let transient = RefusalState::new();
+        let permanent = RefusalState::new();
+        transient.set(Refusal::Transient);
+        permanent.set(Refusal::Permanent);
+        assert!(transient.is_refused() && !transient.is_permanently_refused());
+        assert!(permanent.is_refused() && permanent.is_permanently_refused());
+
+        assert!(transient.clear_transient());
+        assert!(!permanent.clear_transient());
+        assert_eq!(transient.get(), Refusal::None);
+        assert!(!transient.is_refused());
+        assert_eq!(permanent.get(), Refusal::Permanent);
+        assert!(permanent.is_refused() && permanent.is_permanently_refused());
+
+        // 2. Live `evict_lru_in` recovery check on synthetic title textures (#256):
+        //    transient refusal clears only when `evict_lru` frees VRAM (`freed_bytes > 0`),
+        //    allowing the texture to retry and materialize, while permanent refusal stays set.
+        #[cfg(windows)]
+        {
+            use std::collections::BTreeSet;
+            use std::sync::Mutex;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            if crate::host::host().is_none() {
+                return;
+            }
+            let make_tex = || -> This {
+                let mut out = std::ptr::null();
+                assert_eq!(
+                    create_committed(
+                        std::ptr::null(),
+                        &PROPERTIES,
+                        0,
+                        &texture(64, 64, 28, 1),
+                        0,
+                        std::ptr::null(),
+                        &RESOURCE_IIDS[0],
+                        &mut out,
+                    ),
+                    S_OK
+                );
+                out
+            };
+
+            let victim = make_tex();
+            let transient_tex = make_tex();
+            let permanent_tex = make_tex();
+
+            // Materialize `victim` on the host, then age it to frame 10 with fence 5.
+            assert!(host_resource(victim).is_some());
+            resource(victim).host.used.store((10u64 << 32) | 1, Ordering::Relaxed);
+            resource(victim).host.last_fence.store(5, Ordering::Relaxed);
+
+            // Suppress `transient_tex` transiently and `permanent_tex` permanently.
+            resource(transient_tex).host.refused.set(Refusal::Transient);
+            HAS_TRANSIENT_REFUSAL.store(true, Ordering::Release);
+            resource(permanent_tex).host.refused.set(Refusal::Permanent);
+
+            assert!(host_resource(transient_tex).is_none());
+            assert!(host_waits(transient_tex));
+            assert!(host_resource(permanent_tex).is_none());
+            assert!(!host_waits(permanent_tex));
+
+            let table = Mutex::new(BTreeSet::from([
+                victim as usize,
+                transient_tex as usize,
+                permanent_tex as usize,
+            ]));
+            let cursor = AtomicUsize::new(0);
+
+            // Fence not completed (`completed_fence = 4 < 5`) -> `freed_bytes == 0`:
+            // transient refusal must remain suppressed until VRAM is actually freed.
+            assert_eq!(evict_lru_in(&table, &cursor, 4, 200, None, 8), (0, 0));
+            assert_eq!(resource(transient_tex).host.refused.get(), Refusal::Transient);
+            assert_eq!(resource(permanent_tex).host.refused.get(), Refusal::Permanent);
+
+            // Fence completed (`completed_fence = 5`) -> `victim` evicted (`freed_bytes > 0`):
+            // `transient_tex` resets and retries cleanly; `permanent_tex` stays refused!
+            HAS_TRANSIENT_REFUSAL.store(true, Ordering::Release);
+            let (count, freed) = evict_lru_in(&table, &cursor, 5, 200, None, 8);
+            assert_eq!(count, 1);
+            assert!(freed > 0);
+            assert_eq!(resource(transient_tex).host.refused.get(), Refusal::None);
+            assert_eq!(resource(permanent_tex).host.refused.get(), Refusal::Permanent);
+
+            assert!(host_resource(transient_tex).is_some());
+            assert!(host_resource(permanent_tex).is_none());
+
+            assert_eq!(slot::<Release>(victim, 0x10)(victim), 0);
+            assert_eq!(slot::<Release>(transient_tex, 0x10)(transient_tex), 0);
+            assert_eq!(slot::<Release>(permanent_tex, 0x10)(permanent_tex), 0);
+        }
     }
 }

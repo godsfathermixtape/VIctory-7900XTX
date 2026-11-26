@@ -43,14 +43,19 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        room_with_budget(memory, crate::gc::vram_budget_bytes(memory));
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares_with_budget(
+        memory,
+        crate::host::keep_freed() && !pressure,
+        crate::gc::vram_budget_bytes(memory),
+        crate::gc::on(),
+    );
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -65,6 +70,39 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             limit
         };
         pool.reclaim(tick, staging_limit, true);
+    }
+}
+
+/// Updates [`SPARES`] taking `VICTORY_MEM_BUDGET_MB` (or 90% DXGI local budget)
+/// and <= 8 GiB VRAM caps into account when `VICTORY_GC` is enabled, leaving
+/// spare retention unchanged when `VICTORY_GC=0`.
+pub(crate) fn room_with_budget(memory: Option<[u64; 4]>, budget_limit: Option<u64>) {
+    let capped = spares_with_budget(
+        memory,
+        crate::host::keep_freed(),
+        budget_limit,
+        crate::gc::on(),
+    );
+    SPARES.store(capped, Ordering::Relaxed);
+}
+
+pub(crate) fn spares_with_budget(
+    memory: Option<[u64; 4]>,
+    keep: bool,
+    budget_limit: Option<u64>,
+    gc_on: bool,
+) -> usize {
+    let base = spares(memory, keep);
+    if !gc_on {
+        return base;
+    }
+    let eight_gib = 8u64 << 30;
+    let small_vram_limit = (u128::from(eight_gib) * 90 / 100) as u64;
+    match (memory, budget_limit) {
+        (Some([_, used, ..]), Some(limit)) if used > limit => 1,
+        (Some([dxgi_budget, ..]), _) if dxgi_budget <= eight_gib => base.min(SPARE),
+        (_, Some(limit)) if limit <= small_vram_limit => base.min(SPARE),
+        _ => base,
     }
 }
 
@@ -370,6 +408,24 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// Immediately releases rested pieces and drops empty 64 MiB blocks down to 1
+/// spare under VRAM budget pressure, returning the VRAM bytes freed.
+pub(crate) fn trim_empty_blocks() -> u64 {
+    SPARES.store(1, Ordering::Relaxed);
+    let now = now();
+    let freed_tex_blocks = {
+        let mut tex = lock(&TEXTURES);
+        let before = tex.blocks();
+        tex.rested(now);
+        before.saturating_sub(tex.blocks()) as u64
+    };
+    {
+        let mut st = lock(&STAGING);
+        st.rested(now);
+    }
+    freed_tex_blocks * BLOCK
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
